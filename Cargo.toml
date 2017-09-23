@@ -1,0 +1,9 @@
+[package]
+authors = ["Alin Panaitiu <alin.p32@gmail.com>"]
+name = "hog_detector"
+version = "0.1.0"
+
+[dependencies]
+# mac-notification-sys = "0.1.3"
+# notify-rust = "3.4.2"
+sysinfo = "0.3.17"

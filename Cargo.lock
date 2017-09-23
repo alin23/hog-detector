@@ -1,0 +1,23 @@
+[root]
+name = "hog_detector"
+version = "0.1.0"
+dependencies = [
+ "sysinfo 0.3.17 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "libc"
+version = "0.2.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sysinfo"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "libc 0.2.31 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[metadata]
+"checksum libc 0.2.31 (registry+https://github.com/rust-lang/crates.io-index)" = "d1419b2939a0bc44b77feb34661583c7546b532b192feab36249ab584b86856c"
+"checksum sysinfo 0.3.17 (registry+https://github.com/rust-lang/crates.io-index)" = "3a2387d81e77e99fb9f507c8999fe06a26ff089e0e26efa990736c265a3296f4"
