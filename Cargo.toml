@@ -4,6 +4,6 @@ name = "hog_detector"
 version = "0.1.0"
 
 [dependencies]
-# mac-notification-sys = "0.1.3"
-# notify-rust = "3.4.2"
+rmp-serde = "0.13.7"
+serde = "1.0.17"
 sysinfo = "0.3.17"

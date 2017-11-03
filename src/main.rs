@@ -1,40 +1,47 @@
+extern crate serde;
+extern crate rmp_serde as rmps;
 extern crate sysinfo;
 
-use std::thread::sleep;
-use std::time;
-use sysinfo::{System, SystemExt, Process, ProcessExt, Signal};
-use std::process::Command;
-use std::collections::BTreeSet;
-use std::fs::{OpenOptions, File};
-use std::io::{Seek, SeekFrom, Read, Write};
-use std::iter::FromIterator;
-use std::path::Path;
+use rmps::{Deserializer, Serializer};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 
-const POLL_SECONDS: u64 = 2;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::process::Command;
+use std::thread::sleep;
+use std::time;
+use sysinfo::{Process, ProcessExt, Signal, System, SystemExt};
+
+const POLL_SECONDS: u64 = 4;
 const CPU_USAGE_THRESHOLD: f32 = 85.0;
-const HOGS_THRESHOLD: u8 = 3;
+const HOGS_THRESHOLD: u8 = 2;
+const TIMEOUTS_THRESHOLD: u8 = 2;
 const MAX_PIDS: usize = 100_000;
 
-const CACHE_DIR: &str = "/usr/local/var/cache/hog_detector";
+const CACHE_DIR: &str = "/usr/local/var/cache/";
 const NOTIFICATION_TIMEOUT: u64 = 10;
 const NOTIFICATION_ICON: &str = "/Applications/Siri.app/Contents/Resources/Siri.icns";
 const KILL: &str = "Kill";
 const IGNORE: &str = "Ignore";
+const TIMEOUT: &str = "TIMEOUT";
 
 struct HogDetector {
     cache: File,
-    ignored: BTreeSet<String>,
+    ignored: HashMap<String, BTreeSet<String>>,
     hogs: [u8; MAX_PIDS],
+    timeouts: [u8; MAX_PIDS],
 }
 
 impl HogDetector {
-    pub fn new() -> HogDetector {
-
+    pub fn new() -> Self {
         HogDetector {
             ignored: HogDetector::read_ignored_from_cache(),
             cache: HogDetector::open_cache(),
             hogs: [0; MAX_PIDS],
+            timeouts: [0; MAX_PIDS],
         }
     }
 
@@ -47,7 +54,7 @@ impl HogDetector {
             ));
         }
 
-        let cache_path = cache_dir_path.join("cache");
+        let cache_path = cache_dir_path.join("hog_detector");
         OpenOptions::new()
             .read(true)
             .append(true)
@@ -56,31 +63,37 @@ impl HogDetector {
             .expect(&format!("Can't open cache file: {:?}", cache_path))
     }
 
-    fn read_ignored_from_cache() -> BTreeSet<String> {
-        let mut contents = String::new();
+    fn read_ignored_from_cache() -> HashMap<String, BTreeSet<String>> {
+        let mut contents = Vec::new();
         let mut cache = HogDetector::open_cache();
         cache.seek(SeekFrom::Start(0)).expect(
             "Can't seek to beginning of file",
         );
-        cache.read_to_string(&mut contents).expect(
-            "Can't read file to string",
+        let size = cache.read_to_end(&mut contents).expect(
+            "Can't read file to end",
         );
-        BTreeSet::from_iter(contents.split_terminator('\n').map(String::from))
+
+        if size == 0 {
+            return HashMap::new();
+        }
+
+        let mut de = Deserializer::new(&contents[..]);
+        Deserialize::deserialize(&mut de).expect("Can't deserialize cache")
     }
 
     fn ignore(&mut self, process: &Process) -> bool {
         let cmd = process.cmd.join(" ");
-        self.cache.write_all(cmd.as_bytes()).expect(&format!(
-            "Writing cmd failed: {}",
-            cmd
-        ));
-        self.cache.write_all(&[b'\n']).expect(
-            "Writing newline failed",
+        let cmds = self.ignored.entry(process.exe.to_string()).or_insert_with(
+            BTreeSet::new,
         );
-        self.cache.sync_all().unwrap();
-        self.ignored.insert(cmd);
+        cmds.insert(cmd)
+    }
 
-        true
+    fn dump_cache(&mut self) {
+        self.cache.set_len(0).expect("Couldn't truncate cache");
+        self.ignored
+            .serialize(&mut Serializer::new(&mut self.cache))
+            .expect("Couldn't dump cache");
     }
 
     fn notify(&mut self, process: &Process) {
@@ -102,12 +115,58 @@ impl HogDetector {
         if let Ok(out) = String::from_utf8(output.stderr) {
             if let Some(action) = out.rsplitn(2, '@').next() {
                 match action.trim() {
-                    KILL => process.kill(Signal::Kill),
-                    IGNORE => self.ignore(process),
-                    _ => false,
+                    KILL => {
+                        process.kill(Signal::Kill);
+                    }
+                    IGNORE => {
+                        self.ignore(process);
+                        self.dump_cache();
+                    }
+                    TIMEOUT => self.process_timeout(process),
+                    _ => {}
                 };
             };
         }
+    }
+
+    fn process_timeout(&mut self, process: &Process) {
+        let pid = process.pid as usize;
+        if self.timeouts[pid] >= TIMEOUTS_THRESHOLD {
+            self.ignore(process);
+            self.dump_cache();
+            self.timeouts[pid] = 0;
+        } else {
+            self.timeouts[pid] += 1;
+        }
+    }
+
+    fn process_should_be_ignored(&mut self, process: &Process) -> bool {
+        let cmd = process.cmd.join(" ");
+        match self.ignored.get(&process.exe) {
+            Some(cmds) => cmds.len() >= 3 || cmds.contains(&cmd),
+            None => false,
+        }
+    }
+
+    fn process_is_hog(&mut self, process: &Process) -> bool {
+        let pid = process.pid as usize;
+
+        if self.process_should_be_ignored(process) {
+            self.hogs[pid] = 0;
+            return false;
+        }
+
+        if process.cpu_usage > CPU_USAGE_THRESHOLD {
+            if self.hogs[pid] >= HOGS_THRESHOLD {
+                self.hogs[pid] = 0;
+                return true;
+            }
+            self.hogs[pid] += 1;
+        } else {
+            self.hogs[pid] = 0;
+        }
+
+        false
     }
 
     fn watch(&mut self) {
@@ -117,21 +176,10 @@ impl HogDetector {
         loop {
             sys.refresh_processes();
             let processes = sys.get_process_list();
-            for (pid, process) in processes.iter() {
-                let pid = *pid as usize;
-                let cmd = process.cmd.join(" ");
-                if self.ignored.contains(&cmd) {
-                    continue;
+            for (_, process) in processes.iter() {
+                if self.process_is_hog(process) {
+                    self.notify(process);
                 }
-                if process.cpu_usage > CPU_USAGE_THRESHOLD {
-                    if self.hogs[pid] >= HOGS_THRESHOLD {
-                        self.notify(process);
-                    }
-                    self.hogs[pid] += 1;
-                } else {
-                    self.hogs[pid] = 0;
-                }
-
             }
             sleep(poll_seconds);
         }
