@@ -1,19 +1,22 @@
 extern crate serde;
+extern crate serde_json;
+#[macro_use]
+extern crate serde_derive;
 extern crate rmp_serde as rmps;
 extern crate sysinfo;
 
 use rmps::{Deserializer, Serializer};
 use serde::{Deserialize, Serialize};
+use sysinfo::{Process, ProcessExt, Signal, System, SystemExt};
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::Command;
 use std::thread::sleep;
 use std::time;
-use sysinfo::{Process, ProcessExt, Signal, System, SystemExt};
 
 const POLL_SECONDS: u64 = 4;
 const CPU_USAGE_THRESHOLD: f32 = 85.0;
@@ -22,11 +25,22 @@ const TIMEOUTS_THRESHOLD: u8 = 2;
 const MAX_PIDS: usize = 100_000;
 
 const CACHE_DIR: &str = "/usr/local/var/cache/";
+const NOTIFIER_ID: &str = "hog_detector";
 const NOTIFICATION_TIMEOUT: u64 = 10;
 const NOTIFICATION_ICON: &str = "/Applications/Siri.app/Contents/Resources/Siri.icns";
 const KILL: &str = "Kill";
 const IGNORE: &str = "Ignore";
-const TIMEOUT: &str = "TIMEOUT";
+const TIMEOUT: &str = "timeout";
+const CLOSED: &str = "closed";
+const ACTION_CLICKED: &str = "actionClicked";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Notification {
+    activationType: String,
+    activationValue: Option<String>,
+    activationAt: String,
+    deliveredAt: String,
+}
 
 struct HogDetector {
     cache: File,
@@ -48,10 +62,7 @@ impl HogDetector {
     fn open_cache() -> File {
         let cache_dir_path = Path::new(CACHE_DIR);
         if !cache_dir_path.exists() {
-            fs::create_dir_all(cache_dir_path).expect(&format!(
-                "Can't create cache dir: {:?}",
-                cache_dir_path
-            ));
+            fs::create_dir_all(cache_dir_path).expect(&format!("Can't create cache dir: {:?}", cache_dir_path));
         }
 
         let cache_path = cache_dir_path.join("hog_detector");
@@ -102,31 +113,37 @@ impl HogDetector {
             "This process is using {:.2}% of your CPU",
             process.cpu_usage
         );
-        let output = Command::new("/usr/local/bin/terminal-notifier")
+        let output = Command::new("/usr/local/bin/alerter")
             .args(&["-title", &title])
             .args(&["-message", &message])
             .args(&["-actions", KILL])
+            .args(&["-group", NOTIFIER_ID])
             .args(&["-closeLabel", IGNORE])
             .args(&["-appIcon", NOTIFICATION_ICON])
+            .args(&["-json"])
             .args(&["-timeout", &NOTIFICATION_TIMEOUT.to_string()])
             .output()
             .expect("Failed to post notification");
 
-        if let Ok(out) = String::from_utf8(output.stderr) {
-            if let Some(action) = out.rsplitn(2, '@').next() {
-                match action.trim() {
-                    KILL => {
-                        process.kill(Signal::Kill);
+        let notification: Notification = serde_json::from_slice(&output.stdout).unwrap();
+        match &*notification.activationType {
+            ACTION_CLICKED => {
+                if let Some(value) = notification.activationValue {
+                    match &*value {
+                        KILL => {
+                            process.kill(Signal::Kill);
+                        }
+                        _ => {}
                     }
-                    IGNORE => {
-                        self.ignore(process);
-                        self.dump_cache();
-                    }
-                    TIMEOUT => self.process_timeout(process),
-                    _ => {}
-                };
-            };
-        }
+                }
+            }
+            CLOSED => {
+                self.ignore(process);
+                self.dump_cache();
+            }
+            TIMEOUT => self.process_timeout(process),
+            _ => {}
+        };
     }
 
     fn process_timeout(&mut self, process: &Process) {
